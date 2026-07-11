@@ -275,6 +275,46 @@ async fn danger_zone(
     }
 }
 
+fn confirmation_watcher(
+    temp_path: &Path,
+    lock_path: &Path,
+) -> Result<
+    (
+        RecommendedWatcher,
+        mpsc::Receiver<Result<(), notify::Error>>,
+    ),
+    notify::Error,
+> {
+    let (deleted, done) = mpsc::channel(1);
+    let lock_path = lock_path.to_path_buf();
+
+    let mut watcher =
+        recommended_watcher(move |res: Result<notify::event::Event, notify::Error>| {
+            let send_result = match res {
+                Ok(e)
+                    if e.kind == notify::EventKind::Remove(notify::event::RemoveKind::File)
+                        && e.paths.iter().any(|path| path == &lock_path) =>
+                {
+                    debug!("Got canary removal event, sending on channel");
+                    deleted.try_send(Ok(()))
+                }
+                Err(e) => {
+                    debug!("Got error waiting for removal event, sending on channel");
+                    deleted.try_send(Err(e))
+                }
+                Ok(_) => Ok(()),
+            };
+
+            if let Err(e) = send_result {
+                error!("Could not send file system event to watcher: {}", e);
+            }
+        })?;
+
+    watcher.watch(temp_path, RecursiveMode::NonRecursive)?;
+
+    Ok((watcher, done))
+}
+
 pub async fn activation_confirmation(
     temp_path: PathBuf,
     confirm_timeout: u16,
@@ -290,40 +330,55 @@ pub async fn activation_confirmation(
             .map_err(ActivationConfirmationError::CreateConfirmDir)?;
     }
 
+    debug!("Creating notify watcher");
+
+    let (_watcher, done) = confirmation_watcher(&temp_path, &lock_path)?;
+
     debug!("Creating canary file");
 
     fs::File::create(&lock_path)
         .await
         .map_err(ActivationConfirmationError::CreateConfirmFile)?;
 
-    debug!("Creating notify watcher");
-
-    let (deleted, done) = mpsc::channel(1);
-
-    let mut watcher: RecommendedWatcher =
-        recommended_watcher(move |res: Result<notify::event::Event, notify::Error>| {
-            let send_result = match res {
-                Ok(e) if e.kind == notify::EventKind::Remove(notify::event::RemoveKind::File) => {
-                    debug!("Got worthy removal event, sending on channel");
-                    deleted.try_send(Ok(()))
-                }
-                Err(e) => {
-                    debug!("Got error waiting for removal event, sending on channel");
-                    deleted.try_send(Err(e))
-                }
-                Ok(_) => Ok(()), // ignore non-removal events
-            };
-
-            if let Err(e) = send_result {
-                error!("Could not send file system event to watcher: {}", e);
-            }
-        })?;
-
-    watcher.watch(&lock_path, RecursiveMode::NonRecursive)?;
-
     danger_zone(done, confirm_timeout)
         .await
         .map_err(ActivationConfirmationError::WaitingError)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn confirmation_watcher_observes_immediate_canary_removal() {
+        let id = TEMP_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = env::temp_dir().join(format!(
+            "deploy-rs-confirmation-test-{}-{id}",
+            std::process::id()
+        ));
+        let lock_path = temp_path.join("canary");
+
+        fs::create_dir_all(&temp_path)
+            .await
+            .expect("create test directory");
+        let (_watcher, done) =
+            confirmation_watcher(&temp_path, &lock_path).expect("create confirmation watcher");
+
+        fs::File::create(&lock_path)
+            .await
+            .expect("create canary file");
+        fs::remove_file(&lock_path)
+            .await
+            .expect("remove canary file");
+
+        danger_zone(done, 1).await.expect("observe canary removal");
+        fs::remove_dir(&temp_path)
+            .await
+            .expect("remove test directory");
+    }
 }
 
 #[derive(Error, Debug)]
